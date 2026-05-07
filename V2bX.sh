@@ -921,6 +921,309 @@ EOF
     before_show_menu
 }
 
+install_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "${yellow}正在安装 jq...${plain}"
+    if [[ x"${release}" == x"centos" ]]; then
+        yum install -y jq >/dev/null 2>&1
+    elif [[ x"${release}" == x"alpine" ]]; then
+        apk add jq >/dev/null 2>&1
+    elif [[ x"${release}" == x"debian" || x"${release}" == x"ubuntu" ]]; then
+        apt-get install -y jq >/dev/null 2>&1
+    elif [[ x"${release}" == x"arch" ]]; then
+        pacman -S --noconfirm --needed jq >/dev/null 2>&1
+    fi
+}
+
+ensure_xray_files() {
+    if [[ ! -f /etc/V2bX/custom_outbound.json ]]; then
+        cat <<EOF > /etc/V2bX/custom_outbound.json
+[
+    {
+        "tag": "IPv4_out",
+        "protocol": "freedom",
+        "settings": {
+            "domainStrategy": "UseIPv4v6"
+        }
+    },
+    {
+        "tag": "IPv6_out",
+        "protocol": "freedom",
+        "settings": {
+            "domainStrategy": "UseIPv6"
+        }
+    },
+    {
+        "protocol": "blackhole",
+        "tag": "block"
+    }
+]
+EOF
+    fi
+    if [[ ! -f /etc/V2bX/route.json ]]; then
+        cat <<EOF > /etc/V2bX/route.json
+{
+    "domainStrategy": "AsIs",
+    "rules": [
+        {
+            "type": "field",
+            "outboundTag": "block",
+            "ip": [
+                "geoip:private"
+            ]
+        }
+    ]
+}
+EOF
+    fi
+}
+
+ensure_sing_files() {
+    if [[ ! -f /etc/V2bX/sing_origin.json ]]; then
+        ipv6_support=$(check_ipv6_support)
+        dnsstrategy="ipv4_only"
+        if [ "$ipv6_support" -eq 1 ]; then
+            dnsstrategy="prefer_ipv4"
+        fi
+        cat <<EOF > /etc/V2bX/sing_origin.json
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "cf",
+        "address": "1.1.1.1"
+      }
+    ],
+    "strategy": "$dnsstrategy"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct",
+      "domain_resolver": {
+        "server": "cf",
+        "strategy": "$dnsstrategy"
+      }
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "block"
+      },
+      {
+        "outbound": "direct",
+        "network": [
+          "udp","tcp"
+        ]
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
+EOF
+    fi
+}
+
+ensure_hysteria2_files() {
+    if [[ ! -f /etc/V2bX/hy2config.yaml ]]; then
+        cat <<EOF > /etc/V2bX/hy2config.yaml
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
+  disablePathMTUDiscovery: false
+ignoreClientBandwidth: false
+disableUDP: false
+udpIdleTimeout: 60s
+resolver:
+  type: system
+acl:
+  inline:
+    - direct(geosite:google)
+    - reject(geosite:cn)
+    - reject(geoip:cn)
+masquerade:
+  type: 404
+EOF
+    fi
+}
+
+add_node_to_config() {
+    if [[ ! -f /etc/V2bX/config.json ]]; then
+        echo -e "${red}未检测到 /etc/V2bX/config.json，请先选择「全新生成」${plain}"
+        before_show_menu
+        return
+    fi
+
+    install_jq
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${red}jq 安装失败，无法在原有配置上新增节点${plain}"
+        before_show_menu
+        return
+    fi
+
+    if ! jq empty /etc/V2bX/config.json >/dev/null 2>&1; then
+        echo -e "${red}/etc/V2bX/config.json 不是合法 JSON，请先手动修复或选择「全新生成」${plain}"
+        before_show_menu
+        return
+    fi
+
+    echo -e "${yellow}V2bX 在原有配置上新增节点向导${plain}"
+    echo -e "${red}1. 不会覆盖原有 Nodes，仅追加新节点${plain}"
+    echo -e "${red}2. 原配置会备份到 /etc/V2bX/config.json.bak.<时间戳>${plain}"
+    echo -e "${red}3. 若新节点核心未在 Cores 中，会自动追加对应核心配置${plain}"
+    echo -e "${red}4. 仅修改 config.json 中的 Nodes/Cores，其他字段保留不变${plain}"
+    read -rp "确定继续？(y/n): " continue_prompt
+    if [[ "$continue_prompt" =~ ^[Nn][Oo]? ]]; then
+        before_show_menu
+        return
+    fi
+
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    cp /etc/V2bX/config.json /etc/V2bX/config.json.bak.${timestamp}
+    echo -e "${green}已备份原配置到 /etc/V2bX/config.json.bak.${timestamp}${plain}"
+
+    has_xray_in_config=$(jq '[.Cores[]?.Type] | any(. == "xray")' /etc/V2bX/config.json)
+    has_sing_in_config=$(jq '[.Cores[]?.Type] | any(. == "sing")' /etc/V2bX/config.json)
+    has_hysteria2_in_config=$(jq '[.Cores[]?.Type] | any(. == "hysteria2")' /etc/V2bX/config.json)
+
+    nodes_config=()
+    fixed_api_info=false
+    core_xray=false
+    core_sing=false
+    core_hysteria2=false
+    first_node=true
+    added_count=0
+    prev_count=0
+
+    while true; do
+        if [ "$first_node" = true ]; then
+            read -rp "请输入机场网址(https://example.com)：" ApiHost
+            read -rp "请输入面板对接API Key：" ApiKey
+            read -rp "是否设置固定的机场网址和API Key？(y/n)" fixed_api
+            if [ "$fixed_api" = "y" ] || [ "$fixed_api" = "Y" ]; then
+                fixed_api_info=true
+                echo -e "${red}成功固定地址${plain}"
+            fi
+            first_node=false
+            add_node_config
+        else
+            read -rp "是否继续添加节点？(回车继续，输入n或no退出)" continue_adding_node
+            if [[ "$continue_adding_node" =~ ^[Nn][Oo]? ]]; then
+                break
+            elif [ "$fixed_api_info" = false ]; then
+                read -rp "请输入机场网址：" ApiHost
+                read -rp "请输入面板对接API Key：" ApiKey
+            fi
+            add_node_config
+        fi
+
+        cur_count=${#nodes_config[@]}
+        if [ "$cur_count" -gt "$prev_count" ]; then
+            last_node="${nodes_config[$((cur_count-1))]%,}"
+            tmp_file=$(mktemp)
+            if jq --argjson n "$last_node" '.Nodes = ((.Nodes // []) + [$n])' /etc/V2bX/config.json > "$tmp_file" 2>/dev/null; then
+                mv "$tmp_file" /etc/V2bX/config.json
+                added_count=$((added_count + 1))
+                echo -e "${green}节点 NodeID=$NodeID 已追加（本次共 $added_count 个）${plain}"
+            else
+                rm -f "$tmp_file"
+                echo -e "${red}节点 JSON 解析失败，已跳过${plain}"
+            fi
+            prev_count=$cur_count
+        fi
+    done
+
+    if [ "$added_count" -eq 0 ]; then
+        echo -e "${yellow}未追加任何节点，已退出${plain}"
+        before_show_menu
+        return
+    fi
+
+    if [ "$core_xray" = true ] && [ "$has_xray_in_config" = "false" ]; then
+        new_core_xray=$(cat <<'EOF'
+{
+    "Type": "xray",
+    "Log": {
+        "Level": "error",
+        "ErrorPath": "/etc/V2bX/error.log"
+    },
+    "OutboundConfigPath": "/etc/V2bX/custom_outbound.json",
+    "RouteConfigPath": "/etc/V2bX/route.json"
+}
+EOF
+)
+        tmp_file=$(mktemp)
+        jq --argjson c "$new_core_xray" '.Cores = ((.Cores // []) + [$c])' /etc/V2bX/config.json > "$tmp_file" && mv "$tmp_file" /etc/V2bX/config.json
+        ensure_xray_files
+        echo -e "${green}已追加 xray 核心配置${plain}"
+    fi
+
+    if [ "$core_sing" = true ] && [ "$has_sing_in_config" = "false" ]; then
+        new_core_sing=$(cat <<'EOF'
+{
+    "Type": "sing",
+    "Log": {
+        "Level": "error",
+        "Timestamp": true
+    },
+    "NTP": {
+        "Enable": false,
+        "Server": "time.apple.com",
+        "ServerPort": 0
+    },
+    "OriginalPath": "/etc/V2bX/sing_origin.json"
+}
+EOF
+)
+        tmp_file=$(mktemp)
+        jq --argjson c "$new_core_sing" '.Cores = ((.Cores // []) + [$c])' /etc/V2bX/config.json > "$tmp_file" && mv "$tmp_file" /etc/V2bX/config.json
+        ensure_sing_files
+        echo -e "${green}已追加 sing 核心配置${plain}"
+    fi
+
+    if [ "$core_hysteria2" = true ] && [ "$has_hysteria2_in_config" = "false" ]; then
+        new_core_hy2='{"Type":"hysteria2","Log":{"Level":"error"}}'
+        tmp_file=$(mktemp)
+        jq --argjson c "$new_core_hy2" '.Cores = ((.Cores // []) + [$c])' /etc/V2bX/config.json > "$tmp_file" && mv "$tmp_file" /etc/V2bX/config.json
+        ensure_hysteria2_files
+        echo -e "${green}已追加 hysteria2 核心配置${plain}"
+    fi
+
+    echo -e "${green}新增节点完成，共追加 $added_count 个节点，正在重启 V2bX${plain}"
+    restart 0
+    before_show_menu
+}
+
+config_file_menu() {
+    echo -e "${yellow}V2bX 配置文件操作${plain}"
+    echo -e "  ${green}1.${plain} 全新生成（${red}覆盖现有配置${plain}）"
+    echo -e "  ${green}2.${plain} 在原有配置上新增节点"
+    echo -e "  ${green}0.${plain} 返回主菜单"
+    read -rp "请输入 [0-2]: " sub
+    case "$sub" in
+        1) generate_config_file ;;
+        2) add_node_to_config ;;
+        0) show_menu ;;
+        *) echo -e "${red}无效输入${plain}" && before_show_menu ;;
+    esac
+}
+
 # 放开防火墙端口
 open_ports() {
     systemctl stop firewalld.service 2>/dev/null
@@ -951,6 +1254,7 @@ show_usage() {
     echo "V2bX log          - 查看 V2bX 日志"
     echo "V2bX x25519       - 生成 x25519 密钥"
     echo "V2bX generate     - 生成 V2bX 配置文件"
+    echo "V2bX add-node     - 在原有配置上新增节点"
     echo "V2bX update       - 更新 V2bX"
     echo "V2bX update x.x.x - 安装 V2bX 指定版本"
     echo "V2bX install      - 安装 V2bX"
@@ -1006,7 +1310,7 @@ show_menu() {
         12) check_install && show_V2bX_version ;;
         13) check_install && generate_x25519_key ;;
         14) update_shell ;;
-        15) generate_config_file ;;
+        15) config_file_menu ;;
         16) open_ports ;;
         17) exit ;;
         *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
@@ -1026,6 +1330,7 @@ if [[ $# > 0 ]]; then
         "update") check_install 0 && update 0 $2 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
+        "add-node") add_node_to_config ;;
         "install") check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "x25519") check_install 0 && generate_x25519_key 0 ;;
