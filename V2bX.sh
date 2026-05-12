@@ -423,6 +423,9 @@ show_V2bX_version() {
 }
 
 add_node_config() {
+    # 每次调用都重置 TLS / reality 相关变量，避免连续添加节点时残留上次值
+    isreality=""
+    istls=""
     echo -e "${green}请选择节点核心类型：${plain}"
     echo -e "${green}1. xray${plain}"
     echo -e "${green}2. singbox${plain}"
